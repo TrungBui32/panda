@@ -1,0 +1,74 @@
+# panda
+
+A terminal UI for **Linux system monitoring** and **Docker container control**, written in Rust with [ratatui](https://github.com/ratatui/ratatui) and [bollard](https://github.com/fussybeaver/bollard).
+
+panda has two tabs:
+
+- **System** — live CPU and memory gradient charts, load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table sorted by resident memory.
+- **Docker** — a selectable container table with per-container CPU/memory charts, container detail, and lifecycle controls.
+
+## Requirements
+
+- **Linux only.** All system metrics come from the `/proc` and `/sys` pseudo-filesystems. On other platforms the system tab shows zeros.
+- **Rust** (edition 2024) toolchain to build.
+- For the Docker tab: a running Docker daemon and access to its socket (`/var/run/docker.sock`). Add your user to the `docker` group, or run panda with elevated privileges. If the socket is unreachable, the Docker tab shows an "unavailable" panel instead of failing.
+
+## Build & run
+
+```bash
+cargo build --release
+./target/release/panda
+```
+
+Or during development:
+
+```bash
+cargo run
+```
+
+## Keybindings
+
+### Global
+| Key | Action |
+|-----|--------|
+| `mm` | Switch between the System and Docker tabs (press `m` twice) |
+| `q` | Quit |
+| `Esc` | Close the current dialog / exit the current mode |
+
+### System tab
+| Key | Action |
+|-----|--------|
+| `cc` | Enter / exit process **select mode** (press `c` twice) |
+| `↑` / `↓` | Scroll the selection through the full list (wraps around) |
+| `1`–`5` | Sort by PID / USER / COMMAND / CPU% / RES MEM (press again to flip direction) |
+| `0` | Reset sort to default (RES MEM, descending) |
+| `k` | Kill the selected process (asks for confirmation) |
+
+The active sort column is marked with a `^` (ascending) or `v` (descending) arrow in the header, and a scrollbar on the right shows the cursor position.
+
+### Docker tab
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Scroll the container selection (wraps around) |
+| `1`–`5` | Sort by NAME / IMAGE / STATE / CPU% / MEM (press again to flip direction) |
+| `0` | Reset sort to default (NAME, ascending) |
+| `s` | Start the container if stopped, stop it if running |
+| `r` | Restart the container |
+| `p` | Pause / unpause the container |
+| `k` | Kill the container (asks for confirmation) |
+| `d` | Remove the container, forced (asks for confirmation) |
+| `l` | View the last logs; `↑`/`↓` scroll, `Esc`/`l` close |
+
+## Destructive actions & privileges
+
+panda can **kill processes** and **kill/remove Docker containers**. These are confirmed via a bottom action bar before running.
+
+- **Process kill** uses `SIGKILL`. Killing a process you own needs no extra privilege. If the kernel returns `EPERM` (a process owned by another user, e.g. root), panda shows an in-app password bar and runs `sudo -S kill -9 <pid>`.
+  - **Security note:** this captures your sudo password into application memory for the duration of that single action (it is cleared immediately after use). If you prefer not to type your password into panda, run the whole program under `sudo` instead and skip the prompt.
+  - panda will not kill its own process.
+- **Docker actions** target the container's stable **ID** (not its display name) and are gated only by access to the Docker socket — there is no per-action password prompt.
+
+## Notes
+
+- CPU% in tables is the raw value: process CPU is capped at 100%; Docker container CPU can exceed 100% on multi-core hosts. The gradient charts are normalized to 0–100% and are therefore capped.
+- Resident memory uses the system page size (`sysconf(_SC_PAGESIZE)`).
