@@ -7,6 +7,9 @@ panda has two tabs:
 - **System** — live CPU and memory gradient charts, load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table sorted by resident memory.
 - **Docker** — a selectable container table with per-container CPU/memory charts, container detail, and lifecycle controls.
 
+![System tab](images/image-main.png)
+![Docker tab](images/image-docker.png)
+
 ## Requirements
 
 - **Linux only.** All system metrics come from the `/proc` and `/sys` pseudo-filesystems. On other platforms the system tab shows zeros.
