@@ -4,7 +4,7 @@ A terminal UI for **Linux system monitoring** and **Docker container control**, 
 
 panda has two tabs:
 
-- **System** — live CPU and memory gradient charts, load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table sorted by resident memory.
+- **System** — live CPU and memory gradient charts, a per-core utilization heatmap, load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table (sorted by resident memory) with per-process CPU affinity and one-key **core pinning**.
 - **Docker** — a selectable container table with per-container CPU/memory charts, container detail, and lifecycle controls.
 
 ![System tab](images/image-main.png)
@@ -45,6 +45,7 @@ cargo run
 | `↑` / `↓` | Scroll the selection through the full list (wraps around) |
 | `1`–`5` | Sort by PID / USER / COMMAND / CPU% / RES MEM (press again to flip direction) |
 | `0` | Reset sort to default (RES MEM, descending) |
+| `p` | **Pin** the selected process to the least-loaded CPU core (`sched_setaffinity`) |
 | `k` | Kill the selected process (asks for confirmation) |
 
 The active sort column is marked with a `^` (ascending) or `v` (descending) arrow in the header, and a scrollbar on the right shows the cursor position.

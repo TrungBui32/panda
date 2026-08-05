@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    text::Line,
+    text::{Line, Span},
     widgets::{
         canvas::{Canvas, Points},
         Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -85,6 +85,7 @@ struct AppState {
     show_sudo_prompt: bool,
     sudo_password: String,
     kill_feedback: Option<String>,
+    pin_feedback: Option<String>,
 
     // Docker tab
     docker_snapshot: Option<DockerSnapshot>,
@@ -120,6 +121,7 @@ impl AppState {
             show_sudo_prompt: false,
             sudo_password: String::new(),
             kill_feedback: None,
+            pin_feedback: None,
             docker_snapshot: None,
             selected_container: 0,
             dock_sort: DockSort::Name,
@@ -296,7 +298,37 @@ fn render_gradient_chart(
     f.render_widget(canvas, area);
 }
 
-/// Draw a vertical scrollbar on the right edge of `area` (over the block's
+/// Map a per-core utilization (0-100%) to a heat color + block glyph.
+fn core_heat_glyph(usage: f64) -> (Color, &'static str) {
+    if usage >= 90.0 { (Color::Red, "█") }
+    else if usage >= 70.0 { (Color::Yellow, "▆") }
+    else if usage >= 50.0 { (Color::LightRed, "▄") }
+    else if usage >= 30.0 { (Color::LightGreen, "▂") }
+    else if usage > 0.0 { (Color::Green, "·") }
+    else { (Color::DarkGray, "·") }
+}
+
+/// Build the rows for a per-core utilization heatmap, 8 cores per row.
+/// Each cell is "NN▇" (core number + heat glyph), colored by load.
+fn core_heatmap_lines(core_usage: &[f64]) -> Vec<Line<'static>> {
+    const PER_ROW: usize = 8;
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    for (i, &usage) in core_usage.iter().enumerate() {
+        if i % PER_ROW == 0 {
+            rows.push(Vec::new());
+        }
+        let (color, glyph) = core_heat_glyph(usage);
+        rows.last_mut().expect("row exists").push(Span::styled(
+            format!("{:>2}{} ", i, glyph),
+            Style::default().fg(color),
+        ));
+    }
+    if rows.is_empty() {
+        rows.push(vec![Span::raw("  no cores detected")]);
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+/// Write a vertical scrollbar on the right edge of `area` (over the block's
 /// right border), with the thumb tracking `pos` within `total` items.
 fn render_scrollbar(f: &mut ratatui::Frame, area: Rect, total: usize, pos: usize) {
     if total == 0 || area.height < 3 {
@@ -442,14 +474,21 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         middle_sub_chunks[1],
     );
 
-    let core_text = format!(
-        "\n  Model:  {}\n  Vendor: {}\n  Cores:  {}",
-        snapshot.core_info.cpu_model, snapshot.core_info.vendor, snapshot.core_info.physical_core,
-    );
+    let mut core_lines: Vec<Line> = vec![
+        Line::from(format!(
+            "  Model:  {}\n  Vendor: {}\n  Cores:  {} ({} logical)",
+            snapshot.core_info.cpu_model,
+            snapshot.core_info.vendor,
+            snapshot.core_info.physical_core,
+            snapshot.core_usage.len(),
+        )),
+        Line::from(""),
+    ];
+    core_lines.extend(core_heatmap_lines(&snapshot.core_usage));
     f.render_widget(
-        Paragraph::new(core_text).block(
+        Paragraph::new(core_lines).block(
             Block::default()
-                .title("Core Information")
+                .title("CPU Cores / Affinity")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         ),
@@ -491,6 +530,7 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         format!("COMMAND{}", arrow(ProcSort::Command)),
         format!("CPU%{}", arrow(ProcSort::Cpu)),
         format!("RES MEM{}", arrow(ProcSort::Mem)),
+        "AFF".to_string(),
     ];
     let header = Row::new(
         header_labels
@@ -510,6 +550,7 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
                 Cell::from(proc.name.clone()),
                 Cell::from(format!("{:.1}%", proc.cpu_usage)),
                 Cell::from(format!("{:.2} MB", proc.mem_res_kb as f64 / 1024.0)),
+                Cell::from(proc.affinity.clone()),
             ])
             .height(1)
         })
@@ -517,8 +558,10 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
 
     let table_title: String = if let Some(ref msg) = state.kill_feedback {
         format!(" {} ", msg)
+    } else if let Some(ref msg) = state.pin_feedback {
+        format!(" {} ", msg)
     } else if process_mode {
-        format!("Processes ({})  [↑↓ scroll  1-5 sort  0 reset  k kill  cc exit]", total)
+        format!("Processes ({})  [↑↓ scroll  1-5 sort  0 reset  k kill  p pin  cc exit]", total)
     } else {
         format!("Processes ({})  [cc select/scroll  1-5 sort  0 reset]", total)
     };
@@ -526,11 +569,12 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(8),
-            Constraint::Percentage(12),
-            Constraint::Percentage(45),
-            Constraint::Percentage(13),
-            Constraint::Percentage(22),
+            Constraint::Percentage(7),
+            Constraint::Percentage(10),
+            Constraint::Percentage(38),
+            Constraint::Percentage(9),
+            Constraint::Percentage(18),
+            Constraint::Percentage(18),
         ],
     )
     .header(header)
@@ -815,7 +859,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         // Don't panic if /proc is unavailable (non-Linux / sandbox): start from
         // zeroed baselines and let later reads recover once data is available.
-        let mut prev_cpu = CpuRawState::read_from_system().unwrap_or(CpuRawState { total: 0, idle: 0 });
+        let mut prev_cpu = CpuRawState::read_from_system().unwrap_or(CpuRawState { total: 0, idle: 0, cores: Vec::new() });
         let mut prev_net = NetworkMetrics::read_from_system().unwrap_or(NetworkMetrics { rx_bytes: 0, tx_bytes: 0 });
         let mut prev_disk_io = DiskIOState::read_from_system().unwrap_or(DiskIOState { sectors_read: 0, sectors_written: 0 });
         let mut prev_proc_ticks: HashMap<u32, u64> = HashMap::new();
@@ -829,8 +873,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let duration_secs = now.duration_since(last_tick).as_secs_f64();
             last_tick = now;
 
-            let current_cpu = CpuRawState::read_from_system().unwrap_or(prev_cpu);
+            let current_cpu = CpuRawState::read_from_system().unwrap_or_else(|_| prev_cpu.clone());
             let cpu_ptc = CpuRawState::calculate_usage(&prev_cpu, &current_cpu);
+            let core_usage = CpuRawState::calculate_usage_per_core(&prev_cpu, &current_cpu);
             let total_ticks_delta = current_cpu.total.saturating_sub(prev_cpu.total);
             prev_cpu = current_cpu;
 
@@ -862,6 +907,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
+                core_usage,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,
@@ -1220,6 +1266,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         state.kill_target = Some((proc.pid, proc.name.clone()));
                                         state.show_kill_confirm = true;
                                     }
+                                }
+                            }
+                        }
+                        KeyCode::Char('p') if state.active_tab == Tab::System && state.process_mode => {
+                            state.pending_c = false;
+                            let target = state.last_snapshot.as_ref().and_then(|snap| {
+                                snap.processes.get(state.selected_process).map(|proc| {
+                                    let (pid, name) = (proc.pid, proc.name.clone());
+                                    let least = snap
+                                        .core_usage
+                                        .iter()
+                                        .enumerate()
+                                        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                                        .map(|(idx, _)| idx);
+                                    (pid, name, least)
+                                })
+                            });
+                            if let Some((pid, name, least)) = target {
+                                match least {
+                                    Some(core) => match ProcessMetrics::set_affinity(pid, core as u32) {
+                                        Ok(_) => state.pin_feedback = Some(format!(
+                                            "Pinned {} (PID {}) to core {}",
+                                            name, pid, core,
+                                        )),
+                                        Err(e) => state.pin_feedback = Some(format!("Pin failed: {}", e)),
+                                    },
+                                    None => state.pin_feedback = Some("No CPU cores detected".to_string()),
                                 }
                             }
                         }

@@ -9,10 +9,12 @@ const PROC_MEMINFO_PATH: &str = "/proc/meminfo";
 const PROC_NET_DEV_PATH: &str = "/proc/net/dev";
 const PROC_CPU_INFO: &str ="/proc/cpuinfo";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CpuRawState {
     pub total: u64,
     pub idle: u64,
+    /// (total, idle) per logical CPU, indexed by cpuN from /proc/stat.
+    pub cores: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +32,8 @@ pub struct ProcessMetrics {
     pub user: String,
     pub cpu_usage: f64,
     pub mem_res_kb: u64,
+    /// Raw `Cpus_allowed_list` from /proc/<pid>/status, e.g. "0-3,5".
+    pub affinity: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +45,7 @@ pub struct NetworkMetrics {
 #[derive(Debug, Clone)]
 pub struct SystemSnapshot {
     pub cpu_usage: f64,
+    pub core_usage: Vec<f64>,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -61,26 +66,35 @@ pub struct CoreInfo {
 impl CpuRawState {
     pub fn read_from_system() -> std::io::Result<Self> {
         let file = File::open(PROC_STAT_PATH)?;
-        let mut reader = BufReader::new(file);  
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let mut parts = line.split_whitespace();
-        
-        // Skip the "cpu" prefix
-        parts.next();
+        let reader = BufReader::new(file);
 
-        let metrics: Vec<u64> = parts.map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-        
-        if metrics.len() < 4 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Not enough CPU metrics found"));
+        let mut total = 0u64;
+        let mut idle = 0u64;
+        let mut cores: Vec<(u64, u64)> = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let mut parts = line.split_whitespace();
+            let Some(prefix) = parts.next() else { continue };
+            if prefix == "cpu" {
+                let metrics: Vec<u64> = parts.map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                if metrics.len() < 4 {
+                    continue;
+                }
+                total = metrics.iter().sum();
+                idle = metrics[3] + metrics[4]; // idle + iowait
+            } else if prefix.starts_with("cpu") {
+                // Per-core line, e.g. cpu0, cpu1, ... in ascending order.
+                let metrics: Vec<u64> = parts.map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                if metrics.len() >= 4 {
+                    cores.push((metrics.iter().sum(), metrics[3] + metrics[4]));
+                }
+            } else {
+                break; // aggregate + per-core lines come first, then non-cpu rows
+            }
         }
-        
-        let idle = metrics[3] + metrics[4]; // idle + iowait
-        
-        Ok(CpuRawState {
-            total: metrics.iter().sum(),
-            idle,
-        })
+
+        Ok(CpuRawState { total, idle, cores })
     }
 
     pub fn calculate_usage (prev: &Self, current: &Self) -> f64 {
@@ -91,6 +105,22 @@ impl CpuRawState {
         }
         let usage = (total_diff - idle_diff) / total_diff * 100.0;
         usage.clamp(0.0, 100.0)
+    }
+
+    /// Per-logical-CPU utilization (0-100%) across consecutive reads.
+    pub fn calculate_usage_per_core(prev: &Self, current: &Self) -> Vec<f64> {
+        let mut usage = Vec::with_capacity(current.cores.len());
+        for (i, &(cur_total, cur_idle)) in current.cores.iter().enumerate() {
+            let (prev_total, prev_idle) = prev.cores.get(i).copied().unwrap_or((cur_total, cur_idle));
+            let total_diff = cur_total.saturating_sub(prev_total) as f64;
+            let idle_diff = cur_idle.saturating_sub(prev_idle) as f64;
+            if total_diff <= 0.0 {
+                usage.push(0.0);
+            } else {
+                usage.push(((total_diff - idle_diff) / total_diff * 100.0).clamp(0.0, 100.0));
+            }
+        }
+        usage
     }
 }
 
@@ -211,20 +241,25 @@ impl ProcessMetrics{
         let stat_content = fs::read_to_string(stat_path)?;
         let (name, cpu_ticks) = parse_stat(&stat_content);
 
-        // Read UID from /proc/<pid>/status
+        // Read UID and CPU affinity from /proc/<pid>/status
         let status_path = format!("{}/{}/status", PROC_PATH, pid);
         let mut user = String::from("?");
+        let mut affinity = String::from("all");
         if let Ok(status) = fs::read_to_string(status_path) {
             for line in status.lines() {
-                if line.starts_with("Uid:") {
-                    if let Some(uid_str) = line.split_whitespace().nth(1) {
+                if let Some(rest) = line.strip_prefix("Uid:") {
+                    if let Some(uid_str) = rest.split_whitespace().next() {
                         if let Ok(uid) = uid_str.parse::<u32>() {
                             user = uid_map.get(&uid)
                                 .cloned()
                                 .unwrap_or_else(|| uid.to_string());
                         }
                     }
-                    break;
+                } else if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
+                    let v = rest.trim();
+                    if !v.is_empty() {
+                        affinity = v.to_string();
+                    }
                 }
             }
         }
@@ -239,7 +274,25 @@ impl ProcessMetrics{
         let page_kb = if page_size > 0 { page_size as u64 / 1024 } else { 4 };
         let mem_res_kb = res_pages * page_kb;
 
-        Ok((ProcessMetrics { pid, name, user, cpu_usage: 0.0, mem_res_kb }, cpu_ticks))
+        Ok((ProcessMetrics { pid, name, user, cpu_usage: 0.0, mem_res_kb, affinity }, cpu_ticks))
+    }
+
+    /// Pin `pid` to a single logical CPU via `sched_setaffinity`.
+    /// Only the process owner can do this without privileges; other users
+    /// require root (the caller surfaces the error to the UI).
+    pub fn set_affinity(pid: u32, core: u32) -> std::io::Result<()> {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(core as usize, &mut set);
+        }
+        let res = unsafe {
+            libc::sched_setaffinity(pid as libc::pid_t, std::mem::size_of::<libc::cpu_set_t>(), &set)
+        };
+        if res != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -425,25 +478,42 @@ mod tests {
 
     #[test]
     fn cpu_usage_basic() {
-        let prev = CpuRawState { total: 100, idle: 50 };
-        let cur = CpuRawState { total: 200, idle: 100 };
+        let prev = CpuRawState { total: 100, idle: 50, cores: Vec::new() };
+        let cur = CpuRawState { total: 200, idle: 100, cores: Vec::new() };
         // busy = (100 - 50) / 100 = 50%
         assert!((CpuRawState::calculate_usage(&prev, &cur) - 50.0).abs() < 1e-9);
     }
 
     #[test]
     fn cpu_usage_no_delta_is_zero() {
-        let s = CpuRawState { total: 100, idle: 50 };
+        let s = CpuRawState { total: 100, idle: 50, cores: Vec::new() };
         assert_eq!(CpuRawState::calculate_usage(&s, &s), 0.0);
     }
 
     #[test]
     fn cpu_usage_is_clamped() {
         // idle decreasing more than total still clamps into [0, 100]
-        let prev = CpuRawState { total: 100, idle: 100 };
-        let cur = CpuRawState { total: 110, idle: 100 };
+        let prev = CpuRawState { total: 100, idle: 100, cores: Vec::new() };
+        let cur = CpuRawState { total: 110, idle: 100, cores: Vec::new() };
         let u = CpuRawState::calculate_usage(&prev, &cur);
         assert!((0.0..=100.0).contains(&u));
+    }
+
+    #[test]
+    fn per_core_usage_basic() {
+        let prev = CpuRawState {
+            total: 300, idle: 150,
+            cores: vec![(100, 50), (100, 90), (100, 25)],
+        };
+        let cur = CpuRawState {
+            total: 600, idle: 300,
+            cores: vec![(200, 100), (200, 180), (200, 50)],
+        };
+        let u = CpuRawState::calculate_usage_per_core(&prev, &cur);
+        // each core busy = (total-idle)/total
+        assert!((u[0] - 50.0).abs() < 1e-9);
+        assert!((u[1] - 10.0).abs() < 1e-9);
+        assert!((u[2] - 75.0).abs() < 1e-9);
     }
 
     #[test]
