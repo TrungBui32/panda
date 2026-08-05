@@ -4,7 +4,7 @@ A terminal UI for **Linux system monitoring** and **Docker container control**, 
 
 panda has two tabs:
 
-- **System** — live CPU and memory gradient charts, a per-core utilization heatmap, NUMA node topology (per-node memory and CPU locality), load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table (sorted by resident memory) with per-process CPU affinity and one-key **core pinning**.
+- **System** — live CPU and memory gradient charts, a per-core utilization heatmap, NUMA node topology (per-node memory and CPU locality), hugepage pools + transparent-hugepage mode, load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table (sorted by resident memory) with per-process CPU affinity and one-key **core pinning**.
 - **Docker** — a selectable container table with per-container CPU/memory charts, container detail, and lifecycle controls.
 
 ![System tab](images/image-main.png)

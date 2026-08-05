@@ -47,6 +47,7 @@ pub struct SystemSnapshot {
     pub cpu_usage: f64,
     pub core_usage: Vec<f64>,
     pub numa_nodes: Vec<NumaNode>,
+    pub hugepages: HugePageInfo,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -166,6 +167,72 @@ pub fn fetch_numa_nodes() -> Vec<NumaNode> {
 
     nodes.sort_by_key(|n| n.id);
     nodes
+}
+
+/// A single hugepage pool for a given page size.
+#[derive(Debug, Clone)]
+pub struct HugePagePool {
+    pub size_kb: u64,
+    pub nr: u64,
+    pub free: u64,
+    pub resv: u64,
+    pub surplus: u64,
+}
+
+/// Hugepage pools plus the transparent-hugepage mode.
+#[derive(Debug, Clone, Default)]
+pub struct HugePageInfo {
+    pub pools: Vec<HugePagePool>,
+    pub thp_enabled: String, // "always" | "madvise" | "never" ("" if unavailable)
+}
+
+/// Extract the currently-active mode from a THP `enabled` file, which looks
+/// like `always [madvise] never` (the chosen mode is wrapped in brackets).
+fn extract_thp_mode(s: &str) -> String {
+    s.split_whitespace()
+        .find(|w| w.starts_with('[') && w.ends_with(']'))
+        .map(|w| w.trim_matches(&['[', ']'][..]).to_string())
+        .unwrap_or_default()
+}
+
+impl HugePageInfo {
+    pub fn fetch_all() -> Self {
+        const DIR: &str = "/sys/kernel/mm/hugepages";
+        let mut pools = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(DIR) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(sz) = name.strip_prefix("hugepages-").and_then(|s| s.strip_suffix("kB"))
+                else {
+                    continue;
+                };
+                let Ok(size_kb) = sz.parse::<u64>() else { continue };
+                let base = format!("{}/{}", DIR, name);
+                let rd = |f: &str| -> u64 {
+                    fs::read_to_string(format!("{}/{}", base, f))
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0)
+                };
+                pools.push(HugePagePool {
+                    size_kb,
+                    nr: rd("nr_hugepages"),
+                    free: rd("free_hugepages"),
+                    resv: rd("resv_hugepages"),
+                    surplus: rd("surplus_hugepages"),
+                });
+            }
+        }
+        pools.sort_by_key(|p| p.size_kb);
+
+        let thp_enabled = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+            .map(|s| extract_thp_mode(&s))
+            .unwrap_or_default();
+
+        HugePageInfo { pools, thp_enabled }
+    }
 }
 
 impl CpuRawState {
@@ -629,6 +696,14 @@ mod tests {
         assert_eq!(format_cpu_list(&[0, 1, 2, 3, 5]), "0-3,5");
         assert_eq!(format_cpu_list(&[0, 2, 4, 6]), "0,2,4,6");
         assert_eq!(format_cpu_list(&[4, 5, 6, 10, 11, 12]), "4-6,10-12");
+    }
+
+    #[test]
+    fn thp_mode_extraction() {
+        assert_eq!(extract_thp_mode("always [madvise] never"), "madvise");
+        assert_eq!(extract_thp_mode("[always] never"), "always");
+        assert_eq!(extract_thp_mode("always never"), "");
+        assert_eq!(extract_thp_mode(""), "");
     }
 
     #[test]

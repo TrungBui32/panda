@@ -5,7 +5,7 @@
 mod metrics;
 mod docker;
 
-use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list};
+use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo};
 use docker::{DockerAction, DockerSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -435,7 +435,7 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     } else {
         0.0
     };
-    let load_swap_text = format!(
+    let mut load_swap_text = format!(
         "\n  Load:  {:.2}  {:.2}  {:.2}\n  Swap:  {:.2}GB / {:.2}GB ({:.1}%)",
         snapshot.load_avg.one,
         snapshot.load_avg.five,
@@ -444,10 +444,30 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         snapshot.mem.total_swap_kb as f64 / 1024.0 / 1024.0,
         swap_pct,
     );
+    if !snapshot.hugepages.pools.is_empty() {
+        let thp = if snapshot.hugepages.thp_enabled.is_empty() {
+            String::from("n/a")
+        } else {
+            snapshot.hugepages.thp_enabled.clone()
+        };
+        load_swap_text.push_str(&format!("\n  THP:   {}\n", thp));
+        for pool in &snapshot.hugepages.pools {
+            let total_gb = pool.nr as f64 * pool.size_kb as f64 / 1024.0 / 1024.0 / 1024.0;
+            load_swap_text.push_str(&format!(
+                "  HP {}K: {}/{} pg free (resv {}, surplus {}), {:.2}GB\n",
+                pool.size_kb,
+                pool.free,
+                pool.nr,
+                pool.resv,
+                pool.surplus,
+                total_gb,
+            ));
+        }
+    }
     f.render_widget(
         Paragraph::new(load_swap_text).block(
             Block::default()
-                .title("Load Avg (1m 5m 15m) / Swap")
+                .title("Load / Swap / HugePages")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -925,11 +945,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let load_avg = LoadAverage::read_from_system().unwrap_or(LoadAverage { one: 0.0, five: 0.0, fifteen: 0.0 });
             let disk_partitions = DiskPartition::fetch_all();
             let numa_nodes = fetch_numa_nodes();
+            let hugepages = HugePageInfo::fetch_all();
 
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
                 core_usage,
                 numa_nodes,
+                hugepages,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,
