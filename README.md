@@ -50,6 +50,17 @@ cargo run
 
 The active sort column is marked with a `^` (ascending) or `v` (descending) arrow in the header, and a scrollbar on the right shows the cursor position.
 
+### High-performance computing features
+
+panda includes a set of low-latency / HPC-oriented monitoring and control tools in the System tab:
+
+- **Per-core utilization heatmap** — the "CPU Cores / Affinity" panel renders each logical core as a `NN▇` block colored by load (`·` idle → `▂`/`▄` busy → `▆`/`█` saturated).
+- **CPU affinity + core pinning** — every process row shows its allowed CPUs in the **AFF** column (from `Cpus_allowed_list`). In select mode, press **`p`** to pin the selected process to the **least-loaded core** via `sched_setaffinity`.
+- **NUMA topology** — the same panel lists each memory node with used/total memory and its local CPU ranges (e.g. `N0  15.3/15.3G (41%)  cpus 0-21`), so you can keep a process and its memory on the same node.
+- **Hugepages & THP** — the "Load / Swap / HugePages" panel shows the transparent-hugepage mode (`always` / `madvise` / `never`) and every hugepage pool (2 MB, 1 GB) with free, reserved, and surplus page counts and total pool size.
+
+Pinning is the only interactive HPC action. It targets the selected process and requires ownership (root for other users' processes); failures surface as an in-panel message without affecting the rest of the UI.
+
 ### Docker tab
 | Key | Action |
 |-----|--------|
