@@ -46,6 +46,7 @@ pub struct NetworkMetrics {
 pub struct SystemSnapshot {
     pub cpu_usage: f64,
     pub core_usage: Vec<f64>,
+    pub numa_nodes: Vec<NumaNode>,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -61,6 +62,110 @@ pub struct CoreInfo {
     pub cpu_model: String,
     pub vendor: String,
     pub physical_core: u64,
+}
+
+/// A single NUMA node: its memory totals and the logical CPUs local to it.
+#[derive(Debug, Clone)]
+pub struct NumaNode {
+    pub id: u32,
+    pub mem_total_kb: u64,
+    pub mem_used_kb: u64,
+    /// Logical CPU ids that belong to this node (ascending).
+    pub cpus: Vec<u32>,
+}
+
+/// Compress a sorted list of cpu ids into a compact range string, e.g.
+/// `[0,1,2,3,5] -> "0-3,5"`.
+pub fn format_cpu_list(cpus: &[u32]) -> String {
+    let mut out = String::new();
+    let mut it = cpus.iter().copied();
+    let Some(mut start) = it.next() else { return "none".to_string() };
+    let mut prev = start;
+
+    let flush = |start: u32, prev: u32, out: &mut String| {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == prev {
+            out.push_str(&start.to_string());
+        } else {
+            out.push_str(&format!("{}-{}", start, prev));
+        }
+    };
+
+    for c in it {
+        if c == prev + 1 {
+            prev = c;
+        } else {
+            flush(start, prev, &mut out);
+            start = c;
+            prev = c;
+        }
+    }
+    flush(start, prev, &mut out);
+    out
+}
+
+pub fn fetch_numa_nodes() -> Vec<NumaNode> {
+    const NODE_DIR: &str = "/sys/devices/system/node";
+    let mut nodes = Vec::new();
+    let Ok(entries) = fs::read_dir(NODE_DIR) else {
+        return nodes;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(id_str) = name.strip_prefix("node") else { continue };
+        let Ok(id) = id_str.parse::<u32>() else { continue };
+        let base = format!("{}/{}", NODE_DIR, name);
+
+        let mut total = 0u64;
+        let mut free = 0u64;
+        if let Ok(content) = fs::read_to_string(format!("{}/meminfo", base)) {
+            for line in content.lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    let v = value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let k = key.trim();
+                    if k.ends_with("MemTotal") {
+                        total = v;
+                    } else if k.ends_with("MemFree") {
+                        free = v;
+                    }
+                }
+            }
+        }
+
+        let mut cpus = Vec::new();
+        if let Ok(cpu_entries) = fs::read_dir(&base) {
+            for c in cpu_entries.flatten() {
+                let cn = c.file_name();
+                let cn = cn.to_string_lossy();
+                if let Some(rest) = cn.strip_prefix("cpu") {
+                    if !rest.contains('_') {
+                        if let Ok(n) = rest.parse::<u32>() {
+                            cpus.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        cpus.sort_unstable();
+
+        nodes.push(NumaNode {
+            id,
+            mem_total_kb: total,
+            mem_used_kb: total.saturating_sub(free),
+            cpus,
+        });
+    }
+
+    nodes.sort_by_key(|n| n.id);
+    nodes
 }
 
 impl CpuRawState {
@@ -514,6 +619,16 @@ mod tests {
         assert!((u[0] - 50.0).abs() < 1e-9);
         assert!((u[1] - 10.0).abs() < 1e-9);
         assert!((u[2] - 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn format_cpu_list_compresses_ranges() {
+        assert_eq!(format_cpu_list(&[]), "none");
+        assert_eq!(format_cpu_list(&[0]), "0");
+        assert_eq!(format_cpu_list(&[0, 1, 2, 3]), "0-3");
+        assert_eq!(format_cpu_list(&[0, 1, 2, 3, 5]), "0-3,5");
+        assert_eq!(format_cpu_list(&[0, 2, 4, 6]), "0,2,4,6");
+        assert_eq!(format_cpu_list(&[4, 5, 6, 10, 11, 12]), "4-6,10-12");
     }
 
     #[test]

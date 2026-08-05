@@ -5,7 +5,7 @@
 mod metrics;
 mod docker;
 
-use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition};
+use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list};
 use docker::{DockerAction, DockerSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -485,6 +485,26 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         Line::from(""),
     ];
     core_lines.extend(core_heatmap_lines(&snapshot.core_usage));
+    if !snapshot.numa_nodes.is_empty() {
+        core_lines.push(Line::from(""));
+        core_lines.push(Line::from(Span::styled(
+            "  NUMA Nodes",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        for node in &snapshot.numa_nodes {
+            let pct = if node.mem_total_kb > 0 {
+                node.mem_used_kb as f64 / node.mem_total_kb as f64 * 100.0
+            } else {
+                0.0
+            };
+            let used_gb = node.mem_used_kb as f64 / 1024.0 / 1024.0 / 1024.0;
+            let total_gb = node.mem_total_kb as f64 / 1024.0 / 1024.0 / 1024.0;
+            core_lines.push(Line::from(format!(
+                "  N{}  {:>4.1}/{:.1}G ({:.0}%)  cpus {}",
+                node.id, used_gb, total_gb, pct, format_cpu_list(&node.cpus),
+            )));
+        }
+    }
     f.render_widget(
         Paragraph::new(core_lines).block(
             Block::default()
@@ -904,10 +924,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let load_avg = LoadAverage::read_from_system().unwrap_or(LoadAverage { one: 0.0, five: 0.0, fifteen: 0.0 });
             let disk_partitions = DiskPartition::fetch_all();
+            let numa_nodes = fetch_numa_nodes();
 
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
                 core_usage,
+                numa_nodes,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,
