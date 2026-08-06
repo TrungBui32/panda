@@ -784,6 +784,18 @@ fn render_irq_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         format!("Interrupts ({shown}/{total}) [{filter}]  cc select/scroll  p pin  n all/NIC")
     };
 
+    // Coalescing strip (read-only `ethtool -c`) sits above the IRQ table.
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(if snapshot.coalesce_iface.is_some() { 7 } else { 3 }),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let coalesce_area = parts[0];
+    let table_area = parts[1];
+    render_coalescing(f, snapshot, coalesce_area);
+
     let table = Table::new(
         rows,
         [
@@ -810,8 +822,41 @@ fn render_irq_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     );
 
     state.irq_table_state.select(if irq_mode { Some(selected.min(shown.saturating_sub(1))) } else { None });
-    f.render_stateful_widget(table, area, &mut state.irq_table_state);
-    render_scrollbar(f, area, shown, selected.min(shown.saturating_sub(1)));
+    f.render_stateful_widget(table, table_area, &mut state.irq_table_state);
+    render_scrollbar(f, table_area, shown, selected.min(shown.saturating_sub(1)));
+}
+
+/// Read-only `ethtool -c` coalescing block (low-latency tuning view).
+fn render_coalescing(f: &mut ratatui::Frame, snapshot: &SystemSnapshot, area: Rect) {
+    let (iface, params) = match (&snapshot.coalesce_iface, snapshot.coalesce.as_slice()) {
+        (Some(iface), params) => (iface.as_str(), params),
+        _ => {
+            let text = "\n  ethtool -c: no coalescing data (the ethtool binary is not installed, or the\n  NIC does not expose coalescing). Install ethtool to see rx-usecs / tx-usecs.";
+            f.render_widget(
+                Paragraph::new(text).block(
+                    Block::default()
+                        .title(" NIC Coalescing ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
+                area,
+            );
+            return;
+        }
+    };
+    let mut text = format!("  {}  (read-only `ethtool -c`)\n", iface);
+    for (k, v) in params.iter().take(5) {
+        text.push_str(&format!("  {:<20} {}", k, v));
+    }
+    f.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .title(" NIC Coalescing ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        area,
+    );
 }
 
 fn render_docker_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
@@ -1000,12 +1045,17 @@ fn render_docker_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
 fn render_action_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if state.show_sudo_prompt {
         let masked = "*".repeat(state.sudo_password.len());
-        let (pid, name) = state
-            .kill_target
-            .as_ref()
-            .map(|(p, n)| (*p, n.as_str()))
-            .unwrap_or((0, "process"));
-        let text = format!("  Type your password to kill {} (PID {}): {}_", name, pid, masked);
+        let what = if let Some((irq, _cpu)) = state.irq_sudo_target {
+            format!("pin IRQ {irq}")
+        } else {
+            let (pid, name) = state
+                .kill_target
+                .as_ref()
+                .map(|(p, n)| (*p, n.as_str()))
+                .unwrap_or((0, "process"));
+            format!("kill {} (PID {})", name, pid)
+        };
+        let text = format!("  Type your password to {}: {}_", what, masked);
         f.render_widget(
             Paragraph::new(text).block(
                 Block::default()
@@ -1081,6 +1131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut prev_proc_ticks: HashMap<u32, u64> = HashMap::new();
         let mut prev_docker_cpu: HashMap<String, (u64, u64)> = HashMap::new();
         let mut prev_interfaces: Vec<InterfaceMetrics> = Vec::new();
+        let mut ethtool_tick = 0u32;
         let mut last_tick = Instant::now();
 
         loop {
@@ -1131,6 +1182,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let multicast = read_multicast();
             let irqs = read_irqs();
 
+            // Read-only NIC coalescing for the most active interface,
+            // refreshed every 5 ticks (~5s) to avoid forking a process rapidly.
+            let mut coalesce_iface = None;
+            let mut coalesce = Vec::new();
+            if ethtool_tick.is_multiple_of(5) {
+                if let Some(top) = interfaces.iter().max_by(|a, b| {
+                    (a.rx_kbs + a.tx_kbs).partial_cmp(&(b.rx_kbs + b.tx_kbs)).unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    if let Some(params) = metrics::ethtool_coalesce(&top.name) {
+                        coalesce_iface = Some(top.name.clone());
+                        coalesce = params;
+                    }
+                }
+            }
+            ethtool_tick = ethtool_tick.wrapping_add(1);
+
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
                 core_usage,
@@ -1141,6 +1208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 clock,
                 multicast,
                 irqs,
+                coalesce,
+                coalesce_iface,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,

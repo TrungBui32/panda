@@ -53,6 +53,8 @@ pub struct SystemSnapshot {
     pub clock: ClockSync,
     pub multicast: MulticastSummary,
     pub irqs: Vec<IrqInfo>,
+    pub coalesce: Vec<(String, String)>,
+    pub coalesce_iface: Option<String>,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -837,6 +839,31 @@ pub fn read_irqs() -> Vec<IrqInfo> {
 /// Requires root; the caller surfaces `EPERM` to the UI.
 pub fn write_irq_affinity(irq: u32, cpu: u32) -> std::io::Result<()> {
     fs::write(format!("/proc/irq/{irq}/smp_affinity_list"), cpu.to_string())
+}
+
+/// Run `ethtool -c <iface>` (read-only) and return its coalescing key/value
+/// pairs, e.g. `rx-usecs`, `tx-usecs`, `adaptive-rx`. Returns `None` when the
+/// `ethtool` binary is not available or the NIC does not expose coalescing.
+pub fn ethtool_coalesce(iface: &str) -> Option<Vec<(String, String)>> {
+    let out = std::process::Command::new("ethtool")
+        .arg("-c")
+        .arg(iface)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut params: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with("Coalesce parameters") {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            params.push((key.trim().to_string(), val.trim().to_string()));
+        }
+    }
+    Some(params)
 }
 
 impl CoreInfo {
