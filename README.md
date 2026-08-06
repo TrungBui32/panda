@@ -58,6 +58,8 @@ panda includes a set of low-latency / HPC-oriented monitoring and control tools 
 - **CPU affinity + core pinning** — every process row shows its allowed CPUs in the **AFF** column (from `Cpus_allowed_list`). In select mode, press **`p`** to pin the selected process to the **least-loaded core** via `sched_setaffinity`.
 - **NUMA topology** — the same panel lists each memory node with used/total memory and its local CPU ranges (e.g. `N0  15.3/15.3G (41%)  cpus 0-21`), so you can keep a process and its memory on the same node.
 - **Hugepages & THP** — the "Load / Swap / HugePages" panel shows the transparent-hugepage mode (`always` / `madvise` / `never`) and every hugepage pool (2 MB, 1 GB) with free, reserved, and surplus page counts and total pool size.
+- **Per-interface network stats** — the "Network / Clock Sync" panel shows total RX/TX throughput, TCP retransmit count, and, per active interface, RX/TX KB/s plus cumulative error, drop, and multicast counters (all live from `/proc/net/dev` and `/proc/net/snmp`).
+- **Clock sync status** — the same panel reports the PLL/NTP time offset via the `adjtimex(2)` syscall and the first PTP hardware clock (`/sys/class/ptp/ptp0`), for checking drift on a timing-critical host.
 
 Pinning is the only interactive HPC action. It targets the selected process and requires ownership (root for other users' processes); failures surface as an in-panel message without affecting the rest of the UI.
 

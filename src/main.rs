@@ -5,7 +5,7 @@
 mod metrics;
 mod docker;
 
-use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo};
+use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo, InterfaceMetrics, compute_interface_speeds, tcp_retransmits, read_clock_sync};
 use docker::{DockerAction, DockerSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -535,14 +535,35 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         right_sub_chunks[0],
     );
 
-    let net_text = format!(
-        "\n  Download: {:.2} KB/s\n  Upload:   {:.2} KB/s",
-        snapshot.net_rx_speed, snapshot.net_tx_speed,
+    let mut net_text = format!(
+        "  ↓ {:.2}  ↑ {:.2} KB/s   retr {}\n",
+        snapshot.net_rx_speed, snapshot.net_tx_speed, snapshot.tcp_retrans,
     );
+    let mut ifaces = snapshot.interfaces.clone();
+    ifaces.sort_by(|a, b| {
+        (b.rx_kbs + b.tx_kbs)
+            .partial_cmp(&(a.rx_kbs + a.tx_kbs))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for itf in ifaces.iter().take(2) {
+        net_text.push_str(&format!(
+            "  {}  ↓{:.0}  ↑{:.0} KB/s  E{} dr{} mc{}\n",
+            itf.name,
+            itf.rx_kbs,
+            itf.tx_kbs,
+            itf.rx_errs + itf.tx_errs,
+            itf.rx_drops + itf.tx_drops,
+            itf.multicast,
+        ));
+    }
+    net_text.push_str(&format!(
+        "  Clock {} offset {}us  [ptp0:{}]",
+        snapshot.clock.state, snapshot.clock.offset_us, snapshot.clock.ptp_clock,
+    ));
     f.render_widget(
         Paragraph::new(net_text).block(
             Block::default()
-                .title("Network Telemetry")
+                .title("Network / Clock Sync")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         ),
@@ -904,6 +925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut prev_disk_io = DiskIOState::read_from_system().unwrap_or(DiskIOState { sectors_read: 0, sectors_written: 0 });
         let mut prev_proc_ticks: HashMap<u32, u64> = HashMap::new();
         let mut prev_docker_cpu: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut prev_interfaces: Vec<InterfaceMetrics> = Vec::new();
         let mut last_tick = Instant::now();
 
         loop {
@@ -946,12 +968,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let disk_partitions = DiskPartition::fetch_all();
             let numa_nodes = fetch_numa_nodes();
             let hugepages = HugePageInfo::fetch_all();
+            let current_interfaces = InterfaceMetrics::read_all();
+            let interfaces = compute_interface_speeds(&prev_interfaces, &current_interfaces, duration_secs);
+            prev_interfaces = current_interfaces;
+            let tcp_retrans = tcp_retransmits();
+            let clock = read_clock_sync();
 
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
                 core_usage,
                 numa_nodes,
                 hugepages,
+                interfaces,
+                tcp_retrans,
+                clock,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,

@@ -48,6 +48,9 @@ pub struct SystemSnapshot {
     pub core_usage: Vec<f64>,
     pub numa_nodes: Vec<NumaNode>,
     pub hugepages: HugePageInfo,
+    pub interfaces: Vec<InterfaceSnapshot>,
+    pub tcp_retrans: u64,
+    pub clock: ClockSync,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -506,6 +509,159 @@ impl NetworkMetrics {
     }
 }
 
+/// Cumulative per-interface counters read from `/proc/net/dev` (interface name
+/// with the trailing `:` stripped). `lo` is excluded.
+#[derive(Debug, Clone)]
+pub struct InterfaceMetrics {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub rx_errs: u64,
+    pub rx_drops: u64,
+    pub multicast: u64,
+    pub tx_bytes: u64,
+    pub tx_errs: u64,
+    pub tx_drops: u64,
+}
+
+impl InterfaceMetrics {
+    pub fn read_all() -> Vec<Self> {
+        let mut out = Vec::new();
+        if let Ok(content) = fs::read_to_string("/proc/net/dev") {
+            for line in content.lines().skip(2) {
+                let mut parts = line.split_whitespace();
+                let Some(face) = parts.next() else { continue };
+                let name = face.trim_end_matches(':').to_string();
+                if name == "lo" {
+                    continue;
+                }
+                let vals: Vec<u64> = parts.map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                if vals.len() < 16 {
+                    continue;
+                }
+                // receive: bytes packets errs drop fifo frame compressed multicast
+                // transmit: bytes packets errs drop fifo colls carrier compressed
+                out.push(InterfaceMetrics {
+                    name,
+                    rx_bytes: vals[0],
+                    rx_errs: vals[2],
+                    rx_drops: vals[3],
+                    multicast: vals[7],
+                    tx_bytes: vals[8],
+                    tx_errs: vals[10],
+                    tx_drops: vals[11],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Per-interface snapshot with RX/TX rates computed between ticks.
+#[derive(Debug, Clone)]
+pub struct InterfaceSnapshot {
+    pub name: String,
+    pub rx_kbs: f64,
+    pub tx_kbs: f64,
+    pub rx_errs: u64,
+    pub rx_drops: u64,
+    pub tx_errs: u64,
+    pub tx_drops: u64,
+    pub multicast: u64,
+}
+
+fn delta_rate(prev: Option<u64>, cur: u64, dur: f64) -> f64 {
+    if dur <= 0.0 {
+        return 0.0;
+    }
+    let d = cur.saturating_sub(prev.unwrap_or(cur)) as f64;
+    (d / 1024.0) / dur
+}
+
+/// Diff two cumulative per-interface reads into a snapshot list with rates.
+pub fn compute_interface_speeds(
+    prev: &[InterfaceMetrics],
+    cur: &[InterfaceMetrics],
+    duration_secs: f64,
+) -> Vec<InterfaceSnapshot> {
+    cur.iter()
+        .map(|c| {
+            let p = prev.iter().find(|p| p.name == c.name);
+            InterfaceSnapshot {
+                name: c.name.clone(),
+                rx_kbs: delta_rate(p.map(|p| p.rx_bytes), c.rx_bytes, duration_secs),
+                tx_kbs: delta_rate(p.map(|p| p.tx_bytes), c.tx_bytes, duration_secs),
+                rx_errs: c.rx_errs,
+                rx_drops: c.rx_drops,
+                tx_errs: c.tx_errs,
+                tx_drops: c.tx_drops,
+                multicast: c.multicast,
+            }
+        })
+        .collect()
+}
+
+/// Number of TCP retransmitted segments from `/proc/net/snmp`.
+pub fn tcp_retransmits() -> u64 {
+    if let Ok(content) = fs::read_to_string("/proc/net/snmp") {
+        let mut lines = content.lines();
+        while let Some(l) = lines.next() {
+            if !l.starts_with("Tcp:") {
+                continue;
+            }
+            let names: Vec<&str> = l.split_whitespace().collect();
+            if let Some(next) = lines.next() {
+                if next.starts_with("Tcp:") {
+                    let vals: Vec<&str> = next.split_whitespace().collect();
+                    if let Some(idx) = names.iter().position(|n| *n == "RetransSegs") {
+                        return vals.get(idx).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    0
+}
+
+/// Clock sync status: NTP/PLL offset from the `adjtimex(2)` syscall plus the
+/// first available PTP hardware clock name.
+#[derive(Debug, Clone)]
+pub struct ClockSync {
+    /// NTP/PLL time offset in microseconds (negative = local clock behind).
+    pub offset_us: i64,
+    /// Human-readable `adjtimex` time-state (e.g. "TIME_OK", "TIME_ERROR").
+    pub state: String,
+    /// PTP clock device name (e.g. "hyperv"), or "n/a".
+    pub ptp_clock: String,
+}
+
+fn adjtimex_state_str(code: i32) -> &'static str {
+    match code {
+        0 => "TIME_OK",
+        1 => "TIME_INS",
+        2 => "TIME_DEL",
+        3 => "TIME_OOP",
+        4 => "TIME_WAIT",
+        _ => "TIME_ERROR",
+    }
+}
+
+pub fn read_clock_sync() -> ClockSync {
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    let state_code = unsafe { libc::adjtimex(&mut tx) };
+    let offset_us = tx.offset;
+
+    let ptp_clock = fs::read_to_string("/sys/class/ptp/ptp0/clock_name")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "n/a".to_string());
+
+    ClockSync {
+        offset_us,
+        state: adjtimex_state_str(state_code).to_string(),
+        ptp_clock,
+    }
+}
+
 impl CoreInfo {
     pub fn read_from_system() -> std::io::Result<Self> {
         let file = File::open(PROC_CPU_INFO)?;
@@ -720,6 +876,55 @@ mod tests {
         let prev = NetworkMetrics { rx_bytes: 0, tx_bytes: 0 };
         let cur = NetworkMetrics { rx_bytes: 5000, tx_bytes: 5000 };
         assert_eq!(NetworkMetrics::calculate_speed(&prev, &cur, 0.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn interface_speeds_diff() {
+        let prev = vec![InterfaceMetrics {
+            name: "eth0".into(), rx_bytes: 0, rx_errs: 0, rx_drops: 0, multicast: 0,
+            tx_bytes: 0, tx_errs: 0, tx_drops: 0,
+        }];
+        let cur = vec![InterfaceMetrics {
+            name: "eth0".into(), rx_bytes: 2048, rx_errs: 1, rx_drops: 2, multicast: 3,
+            tx_bytes: 1024, tx_errs: 4, tx_drops: 5,
+        }];
+        let snaps = compute_interface_speeds(&prev, &cur, 2.0);
+        assert_eq!(snaps.len(), 1);
+        let s = &snaps[0];
+        assert!((s.rx_kbs - 1.0).abs() < 1e-9); // 2048 B over 2 s
+        assert!((s.tx_kbs - 0.5).abs() < 1e-9);
+        assert_eq!(s.rx_errs, 1);
+        assert_eq!(s.multicast, 3);
+    }
+
+    #[test]
+    fn interface_spe_zero_duration() {
+        let prev = vec![InterfaceMetrics {
+            name: "eth0".into(), rx_bytes: 0, rx_errs: 0, rx_drops: 0, multicast: 0,
+            tx_bytes: 0, tx_errs: 0, tx_drops: 0,
+        }];
+        let cur = prev.clone();
+        let snaps = compute_interface_speeds(&prev, &cur, 0.0);
+        assert_eq!((snaps[0].rx_kbs, snaps[0].tx_kbs), (0.0, 0.0));
+    }
+
+    #[test]
+    fn interface_rate_handles_wrap() {
+        // new interface absent from prev → rate uses cur as baseline (0)
+        let cur = vec![InterfaceMetrics {
+            name: "eth9".into(), rx_bytes: 4096, rx_errs: 0, rx_drops: 0, multicast: 0,
+            tx_bytes: 4096, tx_errs: 0, tx_drops: 0,
+        }];
+        let snaps = compute_interface_speeds(&[], &cur, 1.0);
+        assert_eq!((snaps[0].rx_kbs, snaps[0].tx_kbs), (0.0, 0.0));
+    }
+
+    #[test]
+    fn adjtimex_state_map() {
+        assert_eq!(adjtimex_state_str(0), "TIME_OK");
+        assert_eq!(adjtimex_state_str(1), "TIME_INS");
+        assert_eq!(adjtimex_state_str(5), "TIME_ERROR");
+        assert_eq!(adjtimex_state_str(-1), "TIME_ERROR");
     }
 
     #[test]
