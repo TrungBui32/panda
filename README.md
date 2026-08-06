@@ -9,6 +9,7 @@ panda has three tabs:
 - **Docker** — a selectable container table with per-container CPU/memory charts, container detail, and lifecycle controls.
 
 ![System tab](images/image-main.png)
+![Interrupt tab](images/image-interrupt.png)
 ![Docker tab](images/image-docker.png)
 
 ## Requirements
