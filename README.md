@@ -2,9 +2,10 @@
 
 A terminal UI for **Linux system monitoring** and **Docker container control**, written in Rust with [ratatui](https://github.com/ratatui/ratatui) and [bollard](https://github.com/fussybeaver/bollard).
 
-panda has two tabs:
+panda has three tabs:
 
 - **System** — live CPU and memory gradient charts, a per-core utilization heatmap, NUMA node topology (per-node memory and CPU locality), hugepage pools + transparent-hugepage mode, load average, swap, disk I/O & capacity, network throughput, CPU info, and a process table (sorted by resident memory) with per-process CPU affinity and one-key **core pinning**.
+- **Interrupts** — per-IRQ CPU counts, handler, allowed and effective affinity, and one-key **NIC IRQ pinning** for low-latency network tuning.
 - **Docker** — a selectable container table with per-container CPU/memory charts, container detail, and lifecycle controls.
 
 ![System tab](images/image-main.png)
@@ -34,7 +35,7 @@ cargo run
 ### Global
 | Key | Action |
 |-----|--------|
-| `mm` | Switch between the System and Docker tabs (press `m` twice) |
+| `mm` | Cycle through the System, Interrupts, and Docker tabs (press `m` twice) |
 | `q` | Quit |
 | `Esc` | Close the current dialog / exit the current mode |
 
@@ -60,6 +61,17 @@ panda includes a set of low-latency / HPC-oriented monitoring and control tools 
 - **Hugepages & THP** — the "Load / Swap / HugePages" panel shows the transparent-hugepage mode (`always` / `madvise` / `never`) and every hugepage pool (2 MB, 1 GB) with free, reserved, and surplus page counts and total pool size.
 - **Per-interface network stats** — the "Network / Clock Sync" panel shows total RX/TX throughput, TCP retransmit count, and, per active interface, RX/TX KB/s plus cumulative error, drop, and multicast counters (all live from `/proc/net/dev` and `/proc/net/snmp`).
 - **Clock sync status** — the same panel reports the PLL/NTP time offset via the `adjtimex(2)` syscall and the first PTP hardware clock (`/sys/class/ptp/ptp0`), for checking drift on a timing-critical host.
+- **NIC IRQ affinity + balancing** — the dedicated **Interrupts** tab parses `/proc/interrupts` for every numbered IRQ with per-core counts, its handler name, the allowed affinity (`/proc/irq/N/smp_affinity_list`) and the *effective* core it is currently served on. A NIC-only filter highlights data-path interrupts (virtio/eth/en/ena/mlx/ixgbe…). In select mode, press **`p`** to pin the selected IRQ to the least-loaded of its allowed cores by writing `/proc/irq/N/smp_affinity_list` — the same isolate-network-IRQs-from-trading-cores tuning low-latency teams do daily (root needed; falls back to an in-app sudo prompt).
+
+### Interrupts tab
+| Key | Action |
+|-----|--------|
+| `cc` | Enter / exit IRQ **select mode** |
+| `↑` / `↓` | Move the selection (wraps around) |
+| `p` | **Pin** the selected IRQ to the least-loaded of its allowed cores |
+| `n` | Toggle the filter between **NIC-only** interrupts and **all** interrupts |
+| `0` | Reset: back to the NIC-only filter |
+| `Esc` | Exit select mode |
 - **Multicast membership** — the "Network / Clock Sync" panel also tallies IPv4 (IGMP, from `/proc/net/igmp`) and IPv6 (MLD, from `/proc/net/igmp6`) group memberships and the number of joined interfaces, a quick read-only check for multicast trading feeds.
 
 Pinning is the only interactive HPC action. It targets the selected process and requires ownership (root for other users' processes); failures surface as an in-panel message without affecting the rest of the UI.

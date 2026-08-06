@@ -5,7 +5,7 @@
 mod metrics;
 mod docker;
 
-use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo, InterfaceMetrics, compute_interface_speeds, tcp_retransmits, read_clock_sync, read_multicast};
+use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo, InterfaceMetrics, compute_interface_speeds, tcp_retransmits, read_clock_sync, read_multicast, read_irqs};
 use docker::{DockerAction, DockerSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -42,6 +42,7 @@ const DOCKER_LOG_TAIL: usize = 500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     System,
+    Irq,
     Docker,
 }
 
@@ -87,6 +88,14 @@ struct AppState {
     kill_feedback: Option<String>,
     pin_feedback: Option<String>,
 
+    // Interrupts tab
+    irq_mode: bool,
+    selected_irq: usize,
+    irq_net_only: bool,
+    irq_feedback: Option<String>,
+    irq_sudo_target: Option<(u32, u32)>, // (irq, cpu)
+    irq_table_state: TableState,
+
     // Docker tab
     docker_snapshot: Option<DockerSnapshot>,
     selected_container: usize,
@@ -122,6 +131,12 @@ impl AppState {
             sudo_password: String::new(),
             kill_feedback: None,
             pin_feedback: None,
+            irq_mode: false,
+            selected_irq: 0,
+            irq_net_only: true,
+            irq_feedback: None,
+            irq_sudo_target: None,
+            irq_table_state: TableState::default(),
             docker_snapshot: None,
             selected_container: 0,
             dock_sort: DockSort::Name,
@@ -139,6 +154,17 @@ impl AppState {
 
     fn visible_process_count(&self) -> usize {
         self.last_snapshot.as_ref().map(|s| s.processes.len()).unwrap_or(0)
+    }
+
+    /// Visible interrupts on the Interrupts tab (respecting the net-only filter).
+    fn visible_irqs(&self) -> Vec<&metrics::IrqInfo> {
+        let Some(snap) = self.last_snapshot.as_ref() else {
+            return Vec::new();
+        };
+        snap.irqs
+            .iter()
+            .filter(|i| !self.irq_net_only || i.is_net)
+            .collect()
     }
 
     fn sort_processes(&mut self) {
@@ -351,9 +377,14 @@ fn render_scrollbar(f: &mut ratatui::Frame, area: Rect, total: usize, pos: usize
 fn render_tab_bar(f: &mut ratatui::Frame, area: Rect, active: Tab) {
     let idx = match active {
         Tab::System => 0,
-        Tab::Docker => 1,
+        Tab::Irq => 1,
+        Tab::Docker => 2,
     };
-    let tabs = Tabs::new(vec![Line::from(" System "), Line::from(" Docker ")])
+    let tabs = Tabs::new(vec![
+        Line::from(" System "),
+        Line::from(" Interrupts "),
+        Line::from(" Docker "),
+    ])
         .select(idx)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -366,7 +397,7 @@ fn render_tab_bar(f: &mut ratatui::Frame, area: Rect, active: Tab) {
     let hint = " panda — mm: switch tab   q: quit ";
     let bar = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Min(0)])
+        .constraints([Constraint::Length(30), Constraint::Min(0)])
         .split(area);
     f.render_widget(tabs, bar[0]);
     f.render_widget(
@@ -664,6 +695,123 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     state.proc_table_state.select(if process_mode { Some(selected) } else { None });
     f.render_stateful_widget(table, chunks[1], &mut state.proc_table_state);
     render_scrollbar(f, chunks[1], total, selected.min(total.saturating_sub(1)));
+}
+
+/// Parse a `Cpus_allowed`-style list like `"0-3,5"` into individual CPU ids.
+fn parse_cpu_list(s: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.parse::<u32>(), b.parse::<u32>()) {
+                for c in lo..=hi {
+                    out.push(c);
+                }
+            }
+        } else if let Ok(v) = part.parse::<u32>() {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn render_irq_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
+    let snapshot = match state.last_snapshot {
+        Some(ref s) => s,
+        None => {
+            f.render_widget(
+                Paragraph::new("\n  Collecting…").block(Block::default().title("Interrupts").borders(Borders::ALL)),
+                area,
+            );
+            return;
+        }
+    };
+
+    let irqs = state.visible_irqs();
+    let irq_mode = state.irq_mode;
+    let selected = state.selected_irq;
+    let filter = if state.irq_net_only { "NIC only" } else { "all" };
+
+    if irqs.is_empty() {
+        let msg = if state.irq_net_only {
+            "\n  No NIC-class interrupts (virtio/eth/en/ena/mlx/ixgbe/…) found.\n\n  Press n to toggle the filter to show all interrupts."
+        } else {
+            "\n  No numbered interrupts found."
+        };
+        f.render_widget(
+            Paragraph::new(msg).block(
+                Block::default().title("Interrupts").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)),
+            ),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("IRQ").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Cell::from("HANDLER").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Cell::from("TOTAL").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Cell::from("AFFINITY").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Cell::from("EFFECTIVE").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+    ])
+    .style(Style::default().bg(Color::DarkGray))
+    .height(1);
+
+    let rows: Vec<Row> = irqs
+        .iter()
+        .map(|itf| {
+            Row::new(vec![
+                Cell::from(itf.irq.to_string()),
+                Cell::from(itf.handler.clone()),
+                Cell::from(itf.total.to_string()),
+                Cell::from(itf.affinity.clone()),
+                Cell::from(itf.effective.clone()),
+            ])
+            .height(1)
+        })
+        .collect();
+
+    let shown = irqs.len();
+    let total = snapshot.irqs.len();
+    let title = if let Some(ref msg) = state.irq_feedback {
+        format!(" {msg} ")
+    } else if irq_mode {
+        format!("Interrupts ({shown}/{total}) [{filter}]  ↑↓ select  p pin  n all/NIC  Esc exit")
+    } else {
+        format!("Interrupts ({shown}/{total}) [{filter}]  cc select/scroll  p pin  n all/NIC")
+    };
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(8),
+            Constraint::Percentage(34),
+            Constraint::Percentage(12),
+            Constraint::Percentage(23),
+            Constraint::Percentage(23),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(
+        Style::default().bg(Color::Rgb(60, 60, 120)).fg(Color::White).add_modifier(Modifier::BOLD),
+    )
+    .block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(if irq_mode {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            }),
+    );
+
+    state.irq_table_state.select(if irq_mode { Some(selected.min(shown.saturating_sub(1))) } else { None });
+    f.render_stateful_widget(table, area, &mut state.irq_table_state);
+    render_scrollbar(f, area, shown, selected.min(shown.saturating_sub(1)));
 }
 
 fn render_docker_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
@@ -981,6 +1129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tcp_retrans = tcp_retransmits();
             let clock = read_clock_sync();
             let multicast = read_multicast();
+            let irqs = read_irqs();
 
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
@@ -991,6 +1140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tcp_retrans,
                 clock,
                 multicast,
+                irqs,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,
@@ -1052,6 +1202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match tab {
                 Tab::System => render_system_tab(f, &mut state, outer[1]),
+                Tab::Irq => render_irq_tab(f, &mut state, outer[1]),
                 Tab::Docker => render_docker_tab(f, &mut state, outer[1]),
             }
 
@@ -1073,6 +1224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 state.show_sudo_prompt = false;
                                 state.sudo_password.clear();
                                 state.kill_target = None;
+                                state.irq_sudo_target = None;
                             } else if state.show_kill_confirm {
                                 state.show_kill_confirm = false;
                                 state.kill_target = None;
@@ -1083,6 +1235,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 state.log_scroll = 0;
                             } else if state.process_mode {
                                 state.process_mode = false;
+                                state.pending_c = false;
+                            } else if state.irq_mode {
+                                state.irq_mode = false;
                                 state.pending_c = false;
                             }
                         }
@@ -1115,6 +1270,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Err(e) => {
                                         state.kill_feedback = Some(format!("sudo error: {}", e));
                                         state.kill_target = None;
+                                        state.show_sudo_prompt = false;
+                                        state.sudo_password.clear();
+                                    }
+                                }
+                            } else if let Some((irq, cpu)) = state.irq_sudo_target {
+                                let cmd = format!("echo {cpu} > /proc/irq/{irq}/smp_affinity_list");
+                                let mut child = Command::new("sudo")
+                                    .args(["-S", "sh", "-c", &cmd])
+                                    .stdin(Stdio::piped())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .spawn();
+                                match child {
+                                    Ok(ref mut c) => {
+                                        if let Some(mut stdin) = c.stdin.take() {
+                                            let _ = stdin.write_all(format!("{}\n", state.sudo_password).as_bytes());
+                                        }
+                                        let ok = c.wait().map(|s| s.success()).unwrap_or(false);
+                                        state.sudo_password.clear();
+                                        if ok {
+                                            state.irq_feedback = Some(format!("Pinned IRQ {irq} to core {cpu} via sudo"));
+                                            state.irq_sudo_target = None;
+                                            state.show_sudo_prompt = false;
+                                        } else {
+                                            state.irq_feedback = Some("Wrong password, try again".to_string());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        state.irq_feedback = Some(format!("sudo error: {e}"));
+                                        state.irq_sudo_target = None;
                                         state.show_sudo_prompt = false;
                                         state.sudo_password.clear();
                                     }
@@ -1184,7 +1369,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('m') => {
                             if state.pending_m {
                                 state.active_tab = match state.active_tab {
-                                    Tab::System => Tab::Docker,
+                                    Tab::System => Tab::Irq,
+                                    Tab::Irq => Tab::Docker,
                                     Tab::Docker => Tab::System,
                                 };
                                 state.pending_m = false;
@@ -1334,6 +1520,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
                                     state.log_scroll = 0;
                                     state.show_logs = true;
+                                }
+                            }
+                        }
+
+                        // ── Interrupts tab keys ──────────────────────────────
+                        KeyCode::Char('c') if state.active_tab == Tab::Irq => {
+                            state.pending_m = false;
+                            if state.pending_c {
+                                state.irq_mode = !state.irq_mode;
+                                if state.irq_mode { state.selected_irq = 0; }
+                                state.pending_c = false;
+                            } else {
+                                state.pending_c = true;
+                            }
+                        }
+                        KeyCode::Char('n') if state.active_tab == Tab::Irq => {
+                            state.pending_m = false;
+                            state.irq_net_only = !state.irq_net_only;
+                            state.irq_mode = false;
+                            state.selected_irq = 0;
+                        }
+                        KeyCode::Char('0') if state.active_tab == Tab::Irq => {
+                            state.pending_m = false;
+                            state.irq_net_only = true;
+                            state.irq_mode = false;
+                            state.selected_irq = 0;
+                        }
+                        KeyCode::Up if state.active_tab == Tab::Irq && state.irq_mode => {
+                            state.pending_m = false;
+                            let count = state.visible_irqs().len();
+                            if count > 0 {
+                                state.selected_irq = if state.selected_irq == 0 {
+                                    count - 1
+                                } else {
+                                    state.selected_irq - 1
+                                };
+                            }
+                        }
+                        KeyCode::Down if state.active_tab == Tab::Irq && state.irq_mode => {
+                            state.pending_m = false;
+                            let count = state.visible_irqs().len();
+                            if count > 0 {
+                                state.selected_irq = (state.selected_irq + 1) % count;
+                            }
+                        }
+                        KeyCode::Char('p') if state.active_tab == Tab::Irq && state.irq_mode => {
+                            state.pending_m = false;
+                            let target = state.visible_irqs().get(state.selected_irq).and_then(|itf| {
+                                let affined = parse_cpu_list(&itf.affinity);
+                                let chosen = if affined.is_empty() {
+                                    return None;
+                                } else {
+                                    let mut best = affined[0];
+                                    let mut best_cnt = itf.per_core.get(best as usize).copied().unwrap_or(0);
+                                    for &c in &affined {
+                                        let cnt = itf.per_core.get(c as usize).copied().unwrap_or(0);
+                                        if cnt < best_cnt {
+                                            best_cnt = cnt;
+                                            best = c;
+                                        }
+                                    }
+                                    best
+                                };
+                                Some((itf.irq, chosen, itf.handler.clone()))
+                            });
+                            if let Some((irq, chosen, handler)) = target {
+                                match metrics::write_irq_affinity(irq, chosen) {
+                                    Ok(_) => state.irq_feedback = Some(format!(
+                                        "Pinned IRQ {irq} ({handler}) to core {chosen}"
+                                    )),
+                                    Err(e) => {
+                                        if e.raw_os_error() == Some(libc::EPERM) {
+                                            state.irq_sudo_target = Some((irq, chosen));
+                                            state.show_sudo_prompt = true;
+                                        } else {
+                                            state.irq_feedback = Some(format!("Pin failed: {e}"));
+                                        }
+                                    }
                                 }
                             }
                         }

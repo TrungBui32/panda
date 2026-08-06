@@ -52,6 +52,7 @@ pub struct SystemSnapshot {
     pub tcp_retrans: u64,
     pub clock: ClockSync,
     pub multicast: MulticastSummary,
+    pub irqs: Vec<IrqInfo>,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -747,6 +748,97 @@ pub fn read_multicast() -> MulticastSummary {
     }
 }
 
+/// One interrupt line from `/proc/interrupts` with its CPU affinity.
+#[derive(Debug, Clone)]
+pub struct IrqInfo {
+    pub irq: u32,
+    pub per_core: Vec<u64>,
+    pub total: u64,
+    pub handler: String,
+    pub affinity: String,
+    pub effective: String,
+    pub is_net: bool,
+}
+
+fn is_nic_irq(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("virtio")
+        || n.starts_with("eth")
+        || n.starts_with("en")
+        || n.contains("net")
+        || n.contains("-tx")
+        || n.contains("-rx")
+        || n.contains("nic")
+        || n.contains("ena")
+        || n.contains("mlx")
+        || n.contains("ixgbe")
+        || n.contains("i40e")
+}
+
+/// Parse `/proc/interrupts` into `(num_cores, (irq, per_core_counts, handler))`.
+fn parse_interrupts(content: &str) -> (usize, Vec<(u32, Vec<u64>, String)>) {
+    let mut lines = content.lines();
+    let header = lines.next().unwrap_or("");
+    let n_cores = header.split_whitespace().filter(|t| t.starts_with("CPU")).count();
+    let irqs = lines
+        .filter_map(|l| {
+            let lt = l.trim();
+            if lt.is_empty() {
+                return None;
+            }
+            let mut toks = lt.split_whitespace();
+            let first = toks.next()?;
+            if !first.ends_with(':') {
+                return None;
+            }
+            let irq: u32 = first[..first.len() - 1].parse().ok()?;
+            let counts: Vec<u64> = toks.by_ref().take(n_cores).filter_map(|t| t.parse().ok()).collect();
+            let handler = toks.last().unwrap_or("").to_string();
+            Some((irq, counts, handler))
+        })
+        .collect();
+    (n_cores, irqs)
+}
+
+fn read_affinity_list(path: &str) -> String {
+    fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Read all numbered interrupts with per-core counts and CPU affinity.
+pub fn read_irqs() -> Vec<IrqInfo> {
+    let content = match fs::read_to_string("/proc/interrupts") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let (_n, parsed) = parse_interrupts(&content);
+    parsed
+        .into_iter()
+        .map(|(irq, per_core, handler)| {
+            let affinity = read_affinity_list(&format!("/proc/irq/{irq}/smp_affinity_list"));
+            let effective = read_affinity_list(&format!("/proc/irq/{irq}/effective_affinity_list"));
+            let total: u64 = per_core.iter().sum();
+            let is_net = is_nic_irq(&handler);
+            IrqInfo {
+                irq,
+                per_core,
+                total,
+                handler,
+                affinity,
+                effective,
+                is_net,
+            }
+        })
+        .collect()
+}
+
+/// Re-pin `irq` to a single CPU by writing to `/proc/irq/N/smp_affinity_list`.
+/// Requires root; the caller surfaces `EPERM` to the UI.
+pub fn write_irq_affinity(irq: u32, cpu: u32) -> std::io::Result<()> {
+    fs::write(format!("/proc/irq/{irq}/smp_affinity_list"), cpu.to_string())
+}
+
 impl CoreInfo {
     pub fn read_from_system() -> std::io::Result<Self> {
         let file = File::open(PROC_CPU_INFO)?;
@@ -1049,6 +1141,42 @@ Idx	Device    : 		Group    Users Timer	Reporter
 ";
         let groups = count_igmp6(content);
         assert_eq!(groups, vec![("lo".to_string(), 2), ("eth3".to_string(), 1)]);
+    }
+
+    #[test]
+    fn parse_interrupts_counts_and_handlers() {
+        let content = "\
+           CPU0       CPU1       CPU2
+  8:          0          0          0  IO-APIC   8-edge      rtc0
+ 24:          0          1          0  HV-PCI-MSIX-5582:00:00.0   0-edge      virtio0-config
+ 25:          0          0          2  HV-PCI-MSIX-5582:00:00.0   1-edge      virtio0-virtqueues
+NMI:          0          1          0   Non-maskable interrupts
+LOC:          0          0          0   Local timer interrupts
+";
+        let (n, irqs) = parse_interrupts(content);
+        assert_eq!(n, 3);
+        assert_eq!(irqs.len(), 3);
+        assert_eq!(irqs[0], (8, vec![0, 0, 0], "rtc0".to_string()));
+        assert_eq!(irqs[1], (24, vec![0, 1, 0], "virtio0-config".to_string()));
+        assert_eq!(irqs[2], (25, vec![0, 0, 2], "virtio0-virtqueues".to_string()));
+    }
+
+    #[test]
+    fn parse_interrupts_empty() {
+        assert_eq!(parse_interrupts(""), (0, vec![]));
+        // header but no rows
+        assert_eq!(parse_interrupts("       CPU0       CPU1\n"), (2, vec![]));
+    }
+
+    #[test]
+    fn nic_irq_detection() {
+        assert!(is_nic_irq("virtio1-hiprio"));
+        assert!(is_nic_irq("virtio0-config"));
+        assert!(is_nic_irq("eth4-TxRx-0"));
+        assert!(is_nic_irq("ena0"));
+        assert!(is_nic_irq("ixgbe-eth0"));
+        assert!(!is_nic_irq("rtc0"));
+        assert!(!is_nic_irq("acpi"));
     }
 
     #[test]
