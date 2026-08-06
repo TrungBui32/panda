@@ -5,7 +5,7 @@
 mod metrics;
 mod docker;
 
-use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo, InterfaceMetrics, compute_interface_speeds, tcp_retransmits, read_clock_sync};
+use metrics::{CpuRawState, MemoryMetrics, ProcessMetrics, NetworkMetrics, SystemSnapshot, CoreInfo, LoadAverage, DiskIOState, DiskPartition, fetch_numa_nodes, format_cpu_list, HugePageInfo, InterfaceMetrics, compute_interface_speeds, tcp_retransmits, read_clock_sync, read_multicast};
 use docker::{DockerAction, DockerSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -557,8 +557,15 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         ));
     }
     net_text.push_str(&format!(
-        "  Clock {} offset {}us  [ptp0:{}]",
+        "  Clock {} offset {}us  [ptp0:{}]\n",
         snapshot.clock.state, snapshot.clock.offset_us, snapshot.clock.ptp_clock,
+    ));
+    net_text.push_str(&format!(
+        "  Mcast v4 {} ({} if)  v6 {} ({} if)",
+        snapshot.multicast.ipv4_memberships,
+        snapshot.multicast.ipv4_interfaces,
+        snapshot.multicast.ipv6_memberships,
+        snapshot.multicast.ipv6_interfaces,
     ));
     f.render_widget(
         Paragraph::new(net_text).block(
@@ -973,6 +980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prev_interfaces = current_interfaces;
             let tcp_retrans = tcp_retransmits();
             let clock = read_clock_sync();
+            let multicast = read_multicast();
 
             let snapshot = SystemSnapshot {
                 cpu_usage: cpu_ptc,
@@ -982,6 +990,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 interfaces,
                 tcp_retrans,
                 clock,
+                multicast,
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,

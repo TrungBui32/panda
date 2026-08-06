@@ -51,6 +51,7 @@ pub struct SystemSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
     pub tcp_retrans: u64,
     pub clock: ClockSync,
+    pub multicast: MulticastSummary,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -662,6 +663,90 @@ pub fn read_clock_sync() -> ClockSync {
     }
 }
 
+/// Multicast (IGMP / MLD) group membership summary.
+///
+/// IPv4 memberships come from `/proc/net/igmp` (group addresses are stored as
+/// little-endian hex); IPv6 from `/proc/net/igmp6`. Both count group
+/// memberships per interface — a stream is received on an interface only if it
+/// is in a group there, so this is a useful read-only check for multicast
+/// trading feeds.
+#[derive(Debug, Clone)]
+pub struct MulticastSummary {
+    pub ipv4_memberships: usize,
+    pub ipv4_interfaces: usize,
+    pub ipv6_memberships: usize,
+    pub ipv6_interfaces: usize,
+}
+
+fn count_igmp(content: &str) -> Vec<(String, usize)> {
+    let mut devices: Vec<(String, usize)> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A device line is "1\teth3      : 2 V3": the prefix before the first
+        // ':' is "<index> <device>" where <index> is numeric. The header line
+        // ("Idx Device : ...") and group lines (which embed a ':' inside their
+        // timer field) do not start with a numeric index.
+        if let Some(pos) = trimmed.find(':') {
+            let fields: Vec<&str> = trimmed[..pos].split_whitespace().collect();
+            if fields.len() >= 2 && fields[0].chars().all(|c| c.is_ascii_digit()) {
+                current = Some(fields[1].to_string());
+                devices.push((fields[1].to_string(), 0));
+                continue;
+            }
+        }
+        // Not a device line: treat as a group line of the current device.
+        if let Some(cur) = &current {
+            if let Some((_, count)) = devices.iter_mut().find(|(n, _)| n == cur) {
+                *count += 1;
+            }
+        }
+    }
+    devices
+}
+
+fn parse_igmp() -> Vec<(String, usize)> {
+    fs::read_to_string("/proc/net/igmp")
+        .map(|content| count_igmp(&content))
+        .unwrap_or_default()
+}
+
+fn count_igmp6(content: &str) -> Vec<(String, usize)> {
+    let mut devices: Vec<(String, usize)> = Vec::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let _idx = parts.next();
+        if let Some(dev) = parts.next() {
+            if let Some((_, count)) = devices.iter_mut().find(|(n, _)| n == dev) {
+                *count += 1;
+            } else {
+                devices.push((dev.to_string(), 1));
+            }
+        }
+    }
+    devices
+}
+
+fn parse_igmp6() -> Vec<(String, usize)> {
+    fs::read_to_string("/proc/net/igmp6")
+        .map(|content| count_igmp6(&content))
+        .unwrap_or_default()
+}
+
+pub fn read_multicast() -> MulticastSummary {
+    let v4 = parse_igmp();
+    let v6 = parse_igmp6();
+    MulticastSummary {
+        ipv4_memberships: v4.iter().map(|(_, c)| *c).sum(),
+        ipv4_interfaces: v4.len(),
+        ipv6_memberships: v6.iter().map(|(_, c)| *c).sum(),
+        ipv6_interfaces: v6.len(),
+    }
+}
+
 impl CoreInfo {
     pub fn read_from_system() -> std::io::Result<Self> {
         let file = File::open(PROC_CPU_INFO)?;
@@ -925,6 +1010,45 @@ mod tests {
         assert_eq!(adjtimex_state_str(1), "TIME_INS");
         assert_eq!(adjtimex_state_str(5), "TIME_ERROR");
         assert_eq!(adjtimex_state_str(-1), "TIME_ERROR");
+    }
+
+    #[test]
+    fn count_igmp_groups_per_iface() {
+        let content = "\
+Idx	Device    : Count Querier\tGroup    Users Timer	Reporter
+1	lo        :     2      V3
+				FB0000E0     1 0:00000000		0
+				010000E0     1 0:00000000		0
+6	eth3      :     2      V3
+				FB0000E0     1 0:00000000		0
+				010000E0     1 0:00000000		0
+";
+        let groups = count_igmp(content);
+        assert_eq!(groups, vec![("lo".to_string(), 2), ("eth3".to_string(), 2)]);
+    }
+
+    #[test]
+    fn count_igmp_skips_header_no_orphan_groups() {
+        // A group line before any interface line must not crash or count.
+        let content = "\
+Idx	Device    : 		Group    Users Timer	Reporter
+				FB0000E0     1 0:00000000		0
+6	eth3      :     2      V3
+				010000E0     1 0:00000000		0
+";
+        let groups = count_igmp(content);
+        assert_eq!(groups, vec![("eth3".to_string(), 1)]);
+    }
+
+    #[test]
+    fn count_igmp6_groups_per_iface() {
+        let content = "\
+1    lo              ff0200000000000000000000000000fb     1 00000004 0
+1    lo              ff010000000000000000000000000001     1 00000008 0
+6    eth3            ff010000000000000000000000000001     1 00000008 0
+";
+        let groups = count_igmp6(content);
+        assert_eq!(groups, vec![("lo".to_string(), 2), ("eth3".to_string(), 1)]);
     }
 
     #[test]
