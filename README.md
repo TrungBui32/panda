@@ -62,7 +62,7 @@ panda includes a set of low-latency / HPC-oriented monitoring and control tools 
 - **Hugepages & THP** — the "Load / Swap / HugePages" panel shows the transparent-hugepage mode (`always` / `madvise` / `never`) and every hugepage pool (2 MB, 1 GB) with free, reserved, and surplus page counts and total pool size.
 - **Per-interface network stats** — the "Network / Clock Sync" panel shows total RX/TX throughput, TCP retransmit count, and, per active interface, RX/TX KB/s plus cumulative error, drop, and multicast counters (all live from `/proc/net/dev` and `/proc/net/snmp`).
 - **Clock sync status** — the same panel reports the PLL/NTP time offset via the `adjtimex(2)` syscall and the first PTP hardware clock (`/sys/class/ptp/ptp0`), for checking drift on a timing-critical host.
-- **NIC IRQ affinity + balancing** — the dedicated **Interrupts** tab parses `/proc/interrupts` for every numbered IRQ with per-core counts, its handler name, the allowed affinity (`/proc/irq/N/smp_affinity_list`) and the *effective* core it is currently served on. A NIC-only filter highlights data-path interrupts (virtio/eth/en/ena/mlx/ixgbe…). In select mode, press **`p`** to pin the selected IRQ to the least-loaded of its allowed cores by writing `/proc/irq/N/smp_affinity_list` — the same isolate-network-IRQs-from-trading-cores tuning low-latency teams do daily (root needed; falls back to an in-app sudo prompt). A read-only **NIC coalescing** strip above the table shows `ethtool -c` values (`rx-usecs`, `tx-usecs`, adaptive…) for the busiest interface, so you can see whether interrupt coalescing is enabled without leaving the app.
+- **NIC IRQ affinity + balancing** — the dedicated **Interrupts** tab parses `/proc/interrupts` for every numbered IRQ with per-core counts, its handler name, the allowed affinity (`/proc/irq/N/smp_affinity_list`) and the *effective* core it is currently served on. A NIC-only filter highlights data-path interrupts (virtio/eth/en/ena/mlx/ixgbe…). In select mode, press **`p`** to pin the selected IRQ to the least-loaded of its allowed cores by writing `/proc/irq/N/smp_affinity_list` — the same isolate-network-IRQs-from-trading-cores tuning low-latency teams do daily (root needed; falls back to an in-app sudo prompt). A read-only **NIC coalescing** strip above the table shows `ethtool -c` values (`rx-usecs`, `tx-usecs`, adaptive…) for the busiest interface that supports coalescing, so you can see whether interrupt coalescing is enabled without leaving the app.
 
 ### Interrupts tab
 | Key | Action |
@@ -74,6 +74,8 @@ panda includes a set of low-latency / HPC-oriented monitoring and control tools 
 | `0` | Reset: back to the NIC-only filter |
 | `Esc` | Exit select mode |
 - **Multicast membership** — the "Network / Clock Sync" panel also tallies IPv4 (IGMP, from `/proc/net/igmp`) and IPv6 (MLD, from `/proc/net/igmp6`) group memberships and the number of joined interfaces, a quick read-only check for multicast trading feeds.
+
+NIC coalescing requires both `ethtool` and driver support for `ethtool -c`. Installing the tool alone does not guarantee support, especially on virtual interfaces. Panda tries interfaces in traffic order, excluding loopback, displays the first supported interface, and shows query errors when none support coalescing.
 
 Pinning is the only interactive HPC action. It targets the selected process and requires ownership (root for other users' processes); failures surface as an in-panel message without affecting the rest of the UI.
 

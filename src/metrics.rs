@@ -55,6 +55,7 @@ pub struct SystemSnapshot {
     pub irqs: Vec<IrqInfo>,
     pub coalesce: Vec<(String, String)>,
     pub coalesce_iface: Option<String>,
+    pub coalesce_error: Option<String>,
     pub mem: MemoryMetrics,
     pub net_rx_speed: f64,
     pub net_tx_speed: f64,
@@ -842,16 +843,22 @@ pub fn write_irq_affinity(irq: u32, cpu: u32) -> std::io::Result<()> {
 }
 
 /// Run `ethtool -c <iface>` (read-only) and return its coalescing key/value
-/// pairs, e.g. `rx-usecs`, `tx-usecs`, `adaptive-rx`. Returns `None` when the
-/// `ethtool` binary is not available or the NIC does not expose coalescing.
-pub fn ethtool_coalesce(iface: &str) -> Option<Vec<(String, String)>> {
+/// pairs, e.g. `rx-usecs`, `tx-usecs`, `adaptive-rx`. Preserve the failure
+/// reason so the UI can distinguish missing tools from unsupported devices.
+pub fn ethtool_coalesce(iface: &str) -> Result<Vec<(String, String)>, String> {
     let out = std::process::Command::new("ethtool")
         .arg("-c")
         .arg(iface)
         .output()
-        .ok()?;
+        .map_err(|e| format!("could not run ethtool: {e}"))?;
     if !out.status.success() {
-        return None;
+        let error = String::from_utf8_lossy(&out.stderr);
+        let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Err(if error.is_empty() {
+            format!("ethtool exited with {}", out.status)
+        } else {
+            error
+        });
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut params: Vec<(String, String)> = Vec::new();
@@ -863,7 +870,11 @@ pub fn ethtool_coalesce(iface: &str) -> Option<Vec<(String, String)>> {
             params.push((key.trim().to_string(), val.trim().to_string()));
         }
     }
-    Some(params)
+    if params.is_empty() {
+        Err("ethtool returned no coalescing settings".to_string())
+    } else {
+        Ok(params)
+    }
 }
 
 impl CoreInfo {

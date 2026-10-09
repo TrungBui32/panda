@@ -31,7 +31,7 @@ use ratatui::{
     widgets::{
         canvas::{Canvas, Points},
         Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table, TableState, Tabs,
+        Table, TableState, Tabs, Wrap,
     },
     Terminal,
 };
@@ -380,11 +380,16 @@ fn render_tab_bar(f: &mut ratatui::Frame, area: Rect, active: Tab) {
         Tab::Irq => 1,
         Tab::Docker => 2,
     };
-    let tabs = Tabs::new(vec![
+    let titles = vec![
         Line::from(" System "),
         Line::from(" Interrupts "),
         Line::from(" Docker "),
-    ])
+    ];
+    // Include the widget's default padding and the separators in its width.
+    let tabs_width = titles.iter().map(Line::width).sum::<usize>()
+        + titles.len() * 2
+        + titles.len().saturating_sub(1);
+    let tabs = Tabs::new(titles)
         .select(idx)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -397,7 +402,7 @@ fn render_tab_bar(f: &mut ratatui::Frame, area: Rect, active: Tab) {
     let hint = " panda — mm: switch tab   q: quit ";
     let bar = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(0)])
+        .constraints([Constraint::Length(tabs_width as u16), Constraint::Min(0)])
         .split(area);
     f.render_widget(tabs, bar[0]);
     f.render_widget(
@@ -467,7 +472,7 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         0.0
     };
     let mut load_swap_text = format!(
-        "\n  Load:  {:.2}  {:.2}  {:.2}\n  Swap:  {:.2}GB / {:.2}GB ({:.1}%)",
+        "  Load:  {:.2}  {:.2}  {:.2}\n  Swap:  {:.2}GB / {:.2}GB ({:.1}%)",
         snapshot.load_avg.one,
         snapshot.load_avg.five,
         snapshot.load_avg.fifteen,
@@ -483,10 +488,17 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         };
         load_swap_text.push_str(&format!("\n  THP:   {}\n", thp));
         for pool in &snapshot.hugepages.pools {
-            let total_gb = pool.nr as f64 * pool.size_kb as f64 / 1024.0 / 1024.0 / 1024.0;
+            let total_gb = pool.nr as f64 * pool.size_kb as f64 / 1024.0 / 1024.0;
+            let size = if pool.size_kb.is_multiple_of(1024 * 1024) {
+                format!("{}G", pool.size_kb / (1024 * 1024))
+            } else if pool.size_kb.is_multiple_of(1024) {
+                format!("{}M", pool.size_kb / 1024)
+            } else {
+                format!("{}K", pool.size_kb)
+            };
             load_swap_text.push_str(&format!(
-                "  HP {}K: {}/{} pg free (resv {}, surplus {}), {:.2}GB\n",
-                pool.size_kb,
+                "  HP {}: {}/{} free rsv{} sur{} {:.2}G\n",
+                size,
                 pool.free,
                 pool.nr,
                 pool.resv,
@@ -496,7 +508,7 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
         }
     }
     f.render_widget(
-        Paragraph::new(load_swap_text).block(
+        Paragraph::new(load_swap_text).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title("Load / Swap / HugePages")
                 .borders(Borders::ALL)
@@ -526,18 +538,16 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     );
 
     let mut core_lines: Vec<Line> = vec![
+        Line::from(format!("  Model:  {}", snapshot.core_info.cpu_model)),
+        Line::from(format!("  Vendor: {}", snapshot.core_info.vendor)),
         Line::from(format!(
-            "  Model:  {}\n  Vendor: {}\n  Cores:  {} ({} logical)",
-            snapshot.core_info.cpu_model,
-            snapshot.core_info.vendor,
+            "  Cores:  {} ({} logical)",
             snapshot.core_info.physical_core,
             snapshot.core_usage.len(),
         )),
-        Line::from(""),
     ];
     core_lines.extend(core_heatmap_lines(&snapshot.core_usage));
     if !snapshot.numa_nodes.is_empty() {
-        core_lines.push(Line::from(""));
         core_lines.push(Line::from(Span::styled(
             "  NUMA Nodes",
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
@@ -548,8 +558,8 @@ fn render_system_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
             } else {
                 0.0
             };
-            let used_gb = node.mem_used_kb as f64 / 1024.0 / 1024.0 / 1024.0;
-            let total_gb = node.mem_total_kb as f64 / 1024.0 / 1024.0 / 1024.0;
+            let used_gb = node.mem_used_kb as f64 / 1024.0 / 1024.0;
+            let total_gb = node.mem_total_kb as f64 / 1024.0 / 1024.0;
             core_lines.push(Line::from(format!(
                 "  N{}  {:>4.1}/{:.1}G ({:.0}%)  cpus {}",
                 node.id, used_gb, total_gb, pct, format_cpu_list(&node.cpus),
@@ -788,7 +798,7 @@ fn render_irq_tab(f: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if snapshot.coalesce_iface.is_some() { 7 } else { 3 }),
+            Constraint::Length(if snapshot.coalesce_iface.is_some() { 8 } else { 5 }),
             Constraint::Min(0),
         ])
         .split(area);
@@ -831,9 +841,12 @@ fn render_coalescing(f: &mut ratatui::Frame, snapshot: &SystemSnapshot, area: Re
     let (iface, params) = match (&snapshot.coalesce_iface, snapshot.coalesce.as_slice()) {
         (Some(iface), params) => (iface.as_str(), params),
         _ => {
-            let text = "\n  ethtool -c: no coalescing data (the ethtool binary is not installed, or the\n  NIC does not expose coalescing). Install ethtool to see rx-usecs / tx-usecs.";
+            let text = format!(
+                "  NIC coalescing unavailable\n  {}",
+                snapshot.coalesce_error.as_deref().unwrap_or("No network interfaces to query"),
+            );
             f.render_widget(
-                Paragraph::new(text).block(
+                Paragraph::new(text).wrap(Wrap { trim: true }).block(
                     Block::default()
                         .title(" NIC Coalescing ")
                         .borders(Borders::ALL)
@@ -846,7 +859,7 @@ fn render_coalescing(f: &mut ratatui::Frame, snapshot: &SystemSnapshot, area: Re
     };
     let mut text = format!("  {}  (read-only `ethtool -c`)\n", iface);
     for (k, v) in params.iter().take(5) {
-        text.push_str(&format!("  {:<20} {}", k, v));
+        text.push_str(&format!("  {:<20} {}\n", k, v));
     }
     f.render_widget(
         Paragraph::new(text).block(
@@ -1132,6 +1145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut prev_docker_cpu: HashMap<String, (u64, u64)> = HashMap::new();
         let mut prev_interfaces: Vec<InterfaceMetrics> = Vec::new();
         let mut ethtool_tick = 0u32;
+        let mut coalesce_iface = None;
+        let mut coalesce = Vec::new();
+        let mut coalesce_error = None;
         let mut last_tick = Instant::now();
 
         loop {
@@ -1182,18 +1198,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let multicast = read_multicast();
             let irqs = read_irqs();
 
-            // Read-only NIC coalescing for the most active interface,
-            // refreshed every 5 ticks (~5s) to avoid forking a process rapidly.
-            let mut coalesce_iface = None;
-            let mut coalesce = Vec::new();
+            // Try interfaces in traffic order until one exposes coalescing.
+            // Refresh every 5 ticks and retain the result between refreshes.
             if ethtool_tick.is_multiple_of(5) {
-                if let Some(top) = interfaces.iter().max_by(|a, b| {
-                    (a.rx_kbs + a.tx_kbs).partial_cmp(&(b.rx_kbs + b.tx_kbs)).unwrap_or(std::cmp::Ordering::Equal)
-                }) {
-                    if let Some(params) = metrics::ethtool_coalesce(&top.name) {
-                        coalesce_iface = Some(top.name.clone());
-                        coalesce = params;
+                coalesce_iface = None;
+                coalesce.clear();
+                coalesce_error = None;
+                let mut candidates: Vec<_> = interfaces.iter().filter(|iface| {
+                    // Skip kernel loopback devices (ARPHRD_LOOPBACK = 772).
+                    std::fs::read_to_string(format!("/sys/class/net/{}/type", iface.name))
+                        .map(|kind| kind.trim() != "772")
+                        .unwrap_or(true)
+                }).collect();
+                candidates.sort_by(|a, b| {
+                    (b.rx_kbs + b.tx_kbs).partial_cmp(&(a.rx_kbs + a.tx_kbs)).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut failures: Vec<(String, Vec<String>)> = Vec::new();
+                for iface in candidates {
+                    match metrics::ethtool_coalesce(&iface.name) {
+                        Ok(params) => {
+                            coalesce_iface = Some(iface.name.clone());
+                            coalesce = params;
+                            break;
+                        }
+                        Err(error) => {
+                            if let Some((_, names)) = failures.iter_mut().find(|(reason, _)| *reason == error) {
+                                names.push(iface.name.clone());
+                            } else {
+                                failures.push((error, vec![iface.name.clone()]));
+                            }
+                        }
                     }
+                }
+                if coalesce_iface.is_none() && !failures.is_empty() {
+                    coalesce_error = Some(failures.into_iter().map(|(reason, mut names)| {
+                        names.sort();
+                        format!("{} ({})", reason, names.join(", "))
+                    }).collect::<Vec<_>>().join("\n"));
                 }
             }
             ethtool_tick = ethtool_tick.wrapping_add(1);
@@ -1208,8 +1249,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 clock,
                 multicast,
                 irqs,
-                coalesce,
-                coalesce_iface,
+                coalesce: coalesce.clone(),
+                coalesce_iface: coalesce_iface.clone(),
+                coalesce_error: coalesce_error.clone(),
                 mem,
                 net_rx_speed: rx_speed,
                 net_tx_speed: tx_speed,
